@@ -1,0 +1,443 @@
+name: 🚀 编译 openwrt(Build openwrt)
+
+# 说明：本工作流只做“触发式全量编译”。交互式选包（menuconfig）默认开启，
+# 通过 ttyd(gotty 的活跃维护替代品) + cloudflared 快速隧道在网页上完成。
+# 公网隧道会临时暴露 runner 上的一个 shell，务必阅读 menuconfig 步骤的安全注释。
+
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "openWRT 仓库的拥有者 (Owner of openWRT repo)"
+        type: string
+        required: true
+        default: "pbs05"
+      repo:
+        description: "openWRT 仓库的名字 (Name of openWRT repo)"
+        type: string
+        required: true
+        default: "ponwrt"
+      branch:
+        description: "openWRT 仓库的分支 (Branch of openWRT repo)"
+        type: string
+        required: true
+        default: "master"
+      menuconfig:
+        description: "启动网页版 menuconfig 交互选包（3 分钟限时，纯网页非 SSH）"
+        type: boolean
+        default: true
+
+# 默认最小权限，写权限只在 build 任务内按需授予（避免整条工作流都带写权限）
+permissions: {}
+
+concurrency:
+  # 同一仓库+分支串行编译，避免重复触发时并发抢 runner 和 Release tag
+  group: build-openwrt-${{ inputs.repo }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+env:
+  # 第三方二进制全部固定版本，避免上游改名/被投毒导致 CI 突然挂掉
+  TTYD_VER: "1.7.7"              # https://github.com/tsl0922/ttyd/releases
+  CLOUDFLARED_VER: "2026.10.0"   # https://github.com/cloudflare/cloudflared/releases
+  # 固定校验和，防止上游资产被替换（升级版本时必须同步改这两行）
+  TTYD_SHA256: "8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55"
+  CLOUDFLARED_SHA256: "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db"
+  TTYD_PORT: "7681"
+  # 默认不给 ttyd 传 -i（绑定网卡）。理由：托管 runner 的入站流量被 GitHub 防火墙拦死，
+  # cloudflared 也是连 127.0.0.1，绑 lo 换不来任何额外安全收益；而 libwebsockets 的 -i
+  # 语义是"在该网卡上挑一个最优地址绑定"，runner 上可能挑到 ::1，反而让 127.0.0.1 探活失败。
+  # 交互式选包窗口（秒）。越短越安全，够用即可
+  MENUCONFIG_TIMEOUT: "180"
+  # 编译相关
+  CCACHE_DIR: /home/runner/.cache/ccache
+  CCACHE_MAXSIZE: 5G
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    # 基础镜像：Ubuntu LTS 服务器版（GitHub 托管 Runner 即服务器版，固定到 24.04 LTS）
+    runs-on: ubuntu-24.04
+    name: 🚀 编译 (Build)
+    timeout-minutes: 350          # 托管 runner 上限 360，留 10 分钟给收尾步骤
+    permissions:
+      contents: write             # 只有发 Release 需要
+    steps:
+      - name: Before freeing up disk space
+        run: |
+          echo "Before freeing up disk space"
+          echo "=============================================================================="
+          df -hT
+          echo "=============================================================================="
+
+      - name: Freeing up disk space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 4096
+          # 大内核/固件链接阶段峰值内存较高，留 2G swap 兜底（1 = 不要 swap）
+          swap-size-mb: 2048
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Free up disk space complete
+        run: |
+          echo "Free up disk space complete"
+          echo "=============================================================================="
+          df -hT
+          echo "=============================================================================="
+
+      - name: 下载编译所需的依赖 (Install the software packages required for compilation)
+        run: |
+          set -euo pipefail
+          # 1️⃣ 临时目录指向 Runner 主磁盘，避开 /tmp tmpfs 限制。
+          #    注意：必须写进 GITHUB_ENV，export 只在当前步骤有效。
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          sudo mkdir -p "$RUNNER_TEMP"
+          # ccache 目录（跨步骤可见，且和下面 actions/cache 的 path 保持一致）
+          mkdir -p "$CCACHE_DIR"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=$CCACHE_MAXSIZE" >> "$GITHUB_ENV"
+
+          # 2️⃣ 彻底清理 APT 缓存与包列表（释放 Inode 和残留空间）
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+          sudo apt-get update -y
+
+          # 3️⃣ 安装依赖（按 OpenWrt 官方清单；noble 上 libgmp3-dev 已废弃 → libgmp-dev，
+          #    用 libncurses-dev 取代 libncurses5-dev/libncursesw5-dev）
+          PKGS="ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+            genisoimage git gperf help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+            libgmp-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool lrzsz libnsl-dev ninja-build p7zip p7zip-full patch pkgconf \
+            python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion \
+            swig texinfo uglifyjs upx-ucl unzip wget xmlto xxd zlib1g-dev zstd"
+          # 整批安装；若某包在该镜像上不存在导致整批失败，退化为逐个安装并跳过缺失项，
+          # 避免“一个包不存在 → 整条流水线红”
+          if ! sudo apt-get install -y --no-install-recommends $PKGS; then
+            echo "::warning::批量安装失败，退化为逐个安装"
+            for p in $PKGS; do
+              sudo apt-get install -y --no-install-recommends "$p" \
+                || echo "::warning::跳过不可用依赖: $p"
+            done
+          fi
+
+          # 4️⃣ 安装后再次清理，防止后续步骤空间不足
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+          ccache -M "$CCACHE_MAXSIZE" || true
+
+      - name: 恢复 ccache 缓存 (Restore ccache)
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cache/ccache
+          key: ccache-${{ inputs.repo }}-${{ inputs.branch }}-${{ hashFiles('.config', 'diy.sh') }}
+          restore-keys: |
+            ccache-${{ inputs.repo }}-${{ inputs.branch }}-
+            ccache-
+
+      - name: 克隆当前仓库 (Clone current repo)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # 不要把带写权限的 token 留在 .git/config 里
+
+      - name: 克隆 openWRT 仓库 (Clone openWRT repo)
+        uses: actions/checkout@v4
+        with:
+          repository: "${{ inputs.owner }}/${{ inputs.repo }}"
+          ref: ${{ inputs.branch }}
+          path: openWRT
+          fetch-depth: 1
+          persist-credentials: false
+          # GITHUB_TOKEN 只对“当前仓库”有效；若目标仓库是私有的，需要另配一个 PAT，
+          # 在 Settings → Secrets 里加 OPENWRT_TOKEN（勾了 repo 权限）即可自动生效，
+          # 公有仓库不配也不影响
+          token: ${{ secrets.OPENWRT_TOKEN || github.token }}
+
+      - name: 恢复源码包缓存 dl (Restore download cache)
+        # openWRT/dl 通常 1~3GB，能省掉大量重复下载；仓库缓存额度紧张时可删除本步骤
+        uses: actions/cache@v4
+        with:
+          path: openWRT/dl
+          key: dl-${{ inputs.repo }}-${{ inputs.branch }}-${{ hashFiles('.config', 'diy.sh') }}
+          restore-keys: |
+            dl-${{ inputs.repo }}-${{ inputs.branch }}-
+            dl-
+
+      - name: 复制当前仓库的配置文件到 openWRT 仓库 (Copy current repo config to openWRT repo)
+        run: |
+          set -euo pipefail
+          for f in .config diy.sh; do
+            if [ -f "$f" ]; then
+              cp -f "$f" openWRT/
+            else
+              echo "::warning::仓库根目录下缺少 $f，跳过复制"
+            fi
+          done
+
+      - name: 更新并下载 feeds (Update and download feeds)
+        working-directory: openWRT
+        run: ./scripts/feeds update -a && ./scripts/feeds install -a
+
+      - name: 运行 diy.sh (Run diy.sh)
+        working-directory: openWRT
+        run: |
+          chmod +x diy.sh
+          ./diy.sh
+
+      # ---------------------------------------------------------------------------
+      # 交互式 menuconfig
+      # ⚠️ 安全提示：这一步会在公网暴露一个可写 shell，持续 MENUCONFIG_TIMEOUT 秒。
+      #    公开仓库的运行日志任何人可见，日志里的 URL 会被扫描器抓到，因此：
+      #      1) 建议在仓库 Settings → Secrets 里配置 MENUCONFIG_PASS（Basic Auth 密码），
+      #         这样日志中不出现真实密码；未配置时脚本随机生成并打印。
+      #      2) 拿到 URL 后尽快使用，选完立刻 Save → Exit，或直接关掉标签页。
+      #      3) 关页面/超时会向 menuconfig 发 SIGHUP，未 Save 的改动会丢失。
+      #    不需要这个功能时，取消勾选 menuconfig 输入即可。
+      # ---------------------------------------------------------------------------
+      - name: 启动网页版 menuconfig（交互选包）(Launch web menuconfig)
+        id: menuconfig
+        if: ${{ inputs.menuconfig == true }}
+        timeout-minutes: 10
+        # 交互选包是可选功能：这里出问题（下载失败、拿不到隧道地址等）不应该
+        # 让后面几小时的编译跟着泡汤，所以允许失败并跳过
+        continue-on-error: true
+        env:
+          # 可选：仓库 secret，设置后网页需要输入该密码
+          MENUCONFIG_PASS: ${{ secrets.MENUCONFIG_PASS }}
+        run: |
+          set -euo pipefail
+
+          # 1️⃣ ttyd：gotty 的活跃维护替代品（C + xterm.js，原生支持 -T 终端类型、
+          #    -o 单客户端、Basic Auth）。发布资产名不带版本号，就是 ttyd.x86_64。
+          #    官方二进制是全静态链接（cmake -static），在 24.04 上不依赖系统库。
+          #    下载或校验失败时回退 apt：noble 源里是 ttyd 1.7.4，本步骤用到的
+          #    -W/-w/-T/-o/-m/-c/-i/-p 参数 1.7.4 全部具备，功能等价。
+          TTYD_BIN=""
+          if curl -fsSL -o ttyd \
+              "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VER}/ttyd.x86_64" \
+             && [ "$(sha256sum ttyd | cut -d' ' -f1)" = "${TTYD_SHA256}" ]; then
+            chmod +x ttyd
+            TTYD_BIN="./ttyd"
+          else
+            echo "::warning::ttyd 二进制下载/校验失败，回退 apt 安装（noble 源为 1.7.4）"
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends ttyd
+            TTYD_BIN="$(command -v ttyd)"
+          fi
+          [ -n "$TTYD_BIN" ] || { echo "::error::ttyd 不可用，跳过交互选包"; exit 1; }
+          "$TTYD_BIN" --version || true
+
+          # 2️⃣ cloudflared：快速隧道，把本机 ttyd 暴露为公网 URL
+          curl -fsSL -o cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VER}/cloudflared-linux-amd64"
+          if [ "$(sha256sum cloudflared | cut -d' ' -f1)" != "${CLOUDFLARED_SHA256}" ]; then
+            echo "::error::cloudflared 校验和不匹配，终止交互选包以避免执行来路不明的二进制"
+            exit 1
+          fi
+          chmod +x cloudflared
+
+          # 3️⃣ 密码：优先用 secret，否则随机生成
+          #    注意：不要写成 `tr ... | head -c 16`，head 提前退出会让 tr 收到 SIGPIPE，
+          #    在 set -euo pipefail 下整条管道算失败、直接中断步骤（2026-10-06 实测踩过）
+          if [ -n "${MENUCONFIG_PASS:-}" ]; then
+            TTYD_PASS="$MENUCONFIG_PASS"
+            SHOWN_PASS="你在 secrets.MENUCONFIG_PASS 中设置的密码"
+          elif command -v openssl >/dev/null 2>&1; then
+            TTYD_PASS="$(openssl rand -hex 12)"
+            SHOWN_PASS="$TTYD_PASS"
+          else
+            TTYD_PASS="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+            SHOWN_PASS="$TTYD_PASS"
+          fi
+
+          # 4️⃣ 启动 ttyd：只跑 make menuconfig（不是 shell）；-o + -m 1 保证只有一个客户端，
+          #    避免刷新页面导致多个 menuconfig 并发写同一个 .config。
+          #    刻意不传 -i：托管 runner 入站被防火墙拦截，绑 0.0.0.0 与绑 lo 风险等价，
+          #    而 lws 的 -i 可能绑到 ::1，会让下面的 127.0.0.1 探活失败。
+          setsid "$TTYD_BIN" -W -o -m 1 -p "$TTYD_PORT" \
+            -c "openwrt:$TTYD_PASS" -T xterm-256color \
+            -w "$GITHUB_WORKSPACE/openWRT" make menuconfig >ttyd.log 2>&1 &
+
+          # 5️⃣ 探活（最多 15 秒）。踩过的坑：
+          #    a) 必须用 -u 带上 Basic Auth 凭据——ttyd 的 -c 对首页 HTTP 请求同样生效，
+          #       裸 curl 只会拿到 401，curl -f 判定失败，会被误诊成“网卡绑定失败”；
+          #    b) 不能只 sleep 2 就一锤定音，冷启动偶尔超时。
+          #    只 GET 首页不会让 ttyd 孵化子进程，也不消耗 -o 的单客户端名额。
+          TTYD_READY=0
+          for _ in $(seq 1 15); do
+            if curl -sf -u "openwrt:${TTYD_PASS}" -o /dev/null "http://127.0.0.1:${TTYD_PORT}/"; then
+              TTYD_READY=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$TTYD_READY" != "1" ]; then
+            echo "::error::ttyd 15 秒内未就绪，跳过交互选包"
+            tail -n 20 ttyd.log || true
+            exit 1
+          fi
+
+          # 6️⃣ 启动 cloudflared 打洞（setsid 脱离进程组，步骤结束后仍存活）
+          setsid ./cloudflared tunnel --url "http://127.0.0.1:${TTYD_PORT}" \
+            --logfile cf.log --loglevel info --no-autoupdate >/dev/null 2>&1 &
+
+          # 7️⃣ 轮询 cloudflared 日志提取公网 URL（最多等 60 秒）
+          URL=""
+          for _ in $(seq 1 30); do
+            URL="$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cf.log | head -n1 || true)"
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::未获取到 cloudflared 隧道地址，跳过交互选包"
+            tail -n 20 cf.log || true
+            exit 1
+          fi
+
+          echo "=============================================================================="
+          echo "🌐 浏览器打开：${URL}"
+          echo "🔑 Basic Auth 用户名：openwrt   密码：${SHOWN_PASS}"
+          echo "⏰ ${MENUCONFIG_TIMEOUT} 秒内完成选包：Save 后 Exit，或直接关闭标签页"
+          echo "   注意：直接关页面 = SIGHUP，未 Save 的改动会丢失"
+          echo "=============================================================================="
+          echo "menuconfig_url=${URL}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 🔧 交互式 menuconfig 已就绪"
+            echo ""
+            echo "地址（${MENUCONFIG_TIMEOUT} 秒限时）：**${URL}**"
+            echo ""
+            echo "用户名 \`openwrt\`，密码：\`${SHOWN_PASS}\`"
+            echo ""
+            echo "选完请 **Save → Exit**，或关闭标签页结束等待。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 等待配置（限时，Save 退出或关页面即结束）(Wait for config)
+        if: ${{ inputs.menuconfig == true && steps.menuconfig.outcome == 'success' }}
+        timeout-minutes: 6
+        # 同上：等待环节异常不应中断编译
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          echo "⏳ 等待用户在网页上完成 menuconfig（最多 ${MENUCONFIG_TIMEOUT} 秒）……"
+          END=$(( SECONDS + MENUCONFIG_TIMEOUT ))
+
+          # 阶段 1：等 menuconfig 真正起来（用户打开页面才会 spawn mconf）。
+          # 必须匹配 mconf 而不是 "make menuconfig"——后者会命中 ttyd 自身的命令行。
+          until pgrep -f 'scripts/config/mconf' >/dev/null 2>&1 || [ "$SECONDS" -ge "$END" ]; do
+            sleep 2
+          done
+          if ! pgrep -f 'scripts/config/mconf' >/dev/null 2>&1; then
+            echo "::warning::${MENUCONFIG_TIMEOUT} 秒内未检测到 menuconfig 启动，沿用现有 .config 继续编译"
+          else
+            echo "✅ menuconfig 已启动，等待用户 Save/退出……"
+            # 阶段 2：等它结束（用户 Save + Exit，或关闭页面触发 SIGHUP）
+            while pgrep -f 'scripts/config/mconf' >/dev/null 2>&1 && [ "$SECONDS" -lt "$END" ]; do
+              sleep 1
+            done
+            echo "✅ menuconfig 会话已结束"
+          fi
+
+          # 收尾：无论正常结束还是超时，都彻底清掉隧道与终端
+          pkill -9 -x cloudflared 2>/dev/null || true
+          pkill -9 -x ttyd 2>/dev/null || true
+          pkill -9 -f 'scripts/config/mconf' 2>/dev/null || true
+          pkill -9 -f 'make menuconfig' 2>/dev/null || true
+          fuser -k "${TTYD_PORT}/tcp" 2>/dev/null || true
+
+          echo "👉 openWRT/.config 行数：$(wc -l < openWRT/.config 2>/dev/null || echo 0)"
+          if [ -f .config ] && [ -f openWRT/.config ] && ! diff -q .config openWRT/.config >/dev/null 2>&1; then
+            echo "📝 本次选包相对仓库 .config 的变更行数："
+            diff .config openWRT/.config | grep -c '^[<>]' || true
+          else
+            echo "::warning::openWRT/.config 与仓库根目录 .config 一致（可能未 Save，或 diy.sh 未改动）"
+          fi
+
+      - name: 保存本次选包结果 (Upload .config)
+        if: ${{ inputs.menuconfig == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-config-${{ github.run_id }}
+          path: openWRT/.config
+          if-no-files-found: warn
+
+      - name: 下载 openWRT 源码包 (Download openWRT source packages)
+        working-directory: openWRT
+        run: |
+          set -uo pipefail
+          # 并行下载偶发失败，失败后退回单线程重试
+          make download -j"$(nproc)" V=s || make download -j1 V=s
+
+      - name: 编译 openWRT (Build openWRT)
+        working-directory: openWRT
+        run: |
+          set -uo pipefail
+          # V=s 全量编译日志有几百 MB，直接打到 Actions 日志会被限流/截断，
+          # 因此落盘 build.log，只在失败时打印尾部。
+          JOBS=$(( $(nproc) + 1 ))
+          echo "使用 -j${JOBS} 并行编译"
+          if ! make -j"${JOBS}" CONFIG_CCACHE=y V=s > build.log 2>&1; then
+            echo "::error::并行编译失败，输出最后 300 行日志"
+            tail -n 300 build.log
+            echo "::warning::尝试单线程重试（若总耗时超过 runner 上限会被中断）"
+            make -j1 CONFIG_CCACHE=y V=s >> build.log 2>&1 || {
+              tail -n 300 build.log
+              exit 1
+            }
+          fi
+          echo "✅ 编译完成，完整日志见 build.log"
+
+      - name: 上传失败现场 (Upload logs on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-${{ github.run_id }}
+          path: |
+            openWRT/build.log
+            openWRT/.config
+            openWRT/logs/**
+          if-no-files-found: ignore
+
+      - name: 收集固件文件 (Collect firmware files)
+        id: firmware
+        run: |
+          set -euo pipefail
+          # 覆盖常见产物：itb/bin（路由镜像）、img/img.gz（x86 等）、vhdx/qcow2（虚拟机）
+          FIRMWARE_FILES=$(find openWRT/bin/targets -type f \
+            \( -name "*.itb" -o -name "*.bin" -o -name "*.img" -o -name "*.img.gz" \
+               -o -name "*.vhdx" -o -name "*.qcow2" -o -name "*.tar.gz" \) 2>/dev/null || true)
+          echo "找到以下固件文件："
+          echo "$FIRMWARE_FILES"
+          if [ -z "$FIRMWARE_FILES" ]; then
+            echo "::error::未在 openWRT/bin/targets 下找到任何固件文件，编译可能失败。"
+            exit 1
+          fi
+          # 生成 Release 标签（时间 + run id，避免并发重复）
+          echo "release_tag=$(date +"%Y.%m.%d-%H%M%S")-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - name: 上传固件到 Release (Upload firmware to Release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.firmware.outputs.release_tag }}
+          name: openWRT-${{ steps.firmware.outputs.release_tag }}
+          # 不同靶机产物形态不同（有的没有 qcow2/vhdx），故不开启 fail_on_unmatched_files；
+          # 空 Release 已由上一个“收集固件文件”步骤拦截
+          fail_on_unmatched_files: false
+          body: |
+            openWRT 固件构建产物（.itb / .bin / .img.gz / .qcow2 等）
+            - 仓库：${{ inputs.owner }}/${{ inputs.repo }}
+            - 分支：${{ inputs.branch }}
+            - 运行记录：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: |
+            openWRT/bin/targets/**/*.itb
+            openWRT/bin/targets/**/*.bin
+            openWRT/bin/targets/**/*.img
+            openWRT/bin/targets/**/*.img.gz
+            openWRT/bin/targets/**/*.vhdx
+            openWRT/bin/targets/**/*.qcow2
+            openWRT/bin/targets/**/sha256sums
+            openWRT/bin/targets/**/*.buildinfo
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
