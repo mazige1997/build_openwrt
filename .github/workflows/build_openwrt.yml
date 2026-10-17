@@ -47,7 +47,7 @@ env:
   # cloudflared 也是连 127.0.0.1，绑 lo 换不来任何额外安全收益；而 libwebsockets 的 -i
   # 语义是"在该网卡上挑一个最优地址绑定"，runner 上可能挑到 ::1，反而让 127.0.0.1 探活失败。
   # 交互式选包窗口（秒）。越短越安全，够用即可
-  MENUCONFIG_TIMEOUT: "180"
+  MENUCONFIG_TIMEOUT: "600"
   # 编译相关
   CCACHE_DIR: /home/runner/.cache/ccache
   CCACHE_MAXSIZE: 5G
