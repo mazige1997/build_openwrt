@@ -23,7 +23,7 @@ on:
         required: true
         default: "master"
       menuconfig:
-        description: "启动网页版 menuconfig 交互选包（3 分钟限时，纯网页非 SSH）"
+        description: "启动网页版 menuconfig 交互选包（10 分钟限时，纯网页非 SSH）"
         type: boolean
         default: true
 
